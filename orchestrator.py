@@ -139,7 +139,9 @@ class OrchestratorAgent:
             tasks.append(self.query_agent_with_prompt(step, prompt, "Image Generator", self.validate_image_generation_task))
 
         try:
+            print("Awaiting image tasks...")
             artifacts = await asyncio.gather(*tasks, return_exceptions=False)
+            print("All image tasks completed.")
             await log_message(
                 self.payments, 
                 step["task_id"], 
@@ -188,8 +190,8 @@ class OrchestratorAgent:
 
         async def task_callback(data):
             """Handles updates from the sub-agent's task."""
+            print(':::RECEIVING TASK LOG EVENT:::')
             task_log = json.loads(data)
-            print('RECIBIENDO EVENTO TASK LOG:::')
             if task_log.get("task_status", None) == AgentExecutionStatus.Completed.value:
                 artifacts = await validate_task_fn(task_log["task_id"])
                 print("Finished task:", task_log["task_id"], artifacts)
