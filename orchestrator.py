@@ -5,6 +5,7 @@ from payments_py.data_models import AgentExecutionStatus
 from payments.ensure_balance import ensure_sufficient_balance
 from logger.logger import logger
 from utils.log_message import log_message
+from classes.TaskRegistry import TaskRegistry
 from config.env import (
     SCRIPT_GENERATOR_DID,
     CHARACTER_EXTRACTOR_DID,
@@ -97,13 +98,11 @@ class OrchestratorAgent:
         task_data = {"query": step["input_query"], "name": step["name"], "additional_params": [], "artifacts": []}
 
         async def task_callback(data):
-            task_log = json.loads(data)
-            if task_log.get("task_status", None) == "Completed":
-                await self.validate_generic_task(task_log["task_id"], agent_did, step)
-            else:
-                await log_message(self.payments, step["task_id"], "info", task_log['message'])
+            if data.get("task_status", None) == AgentExecutionStatus.Completed.value:
+                await self.validate_generic_task(data["task_id"], agent_did, step)
 
         result = await self.payments.ai_protocol.create_task(agent_did, task_data, task_callback)
+        
         if getattr(result, "status_code", 0) == 201:
             await log_message(self.payments, step["task_id"], "info", "Task created successfully.")
         else:
@@ -114,7 +113,7 @@ class OrchestratorAgent:
                 f"Error creating task for {agent_name}: {result}", 
                 AgentExecutionStatus.Failed
             )
-
+            await self.error_generic_task(step)
 
 
     async def handle_image_generation_for_characters(self, step):
@@ -136,30 +135,36 @@ class OrchestratorAgent:
         
         for character in characters_json:
             prompt = self.generate_text_to_image_prompt(character)
-            tasks.append(self.query_agent_with_prompt(step, prompt, "Image Generator", self.validate_image_generation_task))
+            task = asyncio.ensure_future(self.query_agent_with_prompt(step, prompt, "Image Generator"))
+            tasks.append(task)
 
         try:
-            print("Awaiting image tasks...")
-            artifacts = await asyncio.gather(*tasks, return_exceptions=False)
-            print("All image tasks completed.")
-            await log_message(
-                self.payments, 
+            # Execute all tasks concurrently and wait for their completion
+            artifacts = await asyncio.gather(*tasks)
+            print(":::HEMOS TERMINADO TODAS LAS TAREAS:::")
+            self.payments.ai_protocol.update_step(
+                step["did"], 
                 step["task_id"], 
-                "info", 
-                "All image tasks completed.", 
-                AgentExecutionStatus.Completed
+                step_id=step["step_id"], 
+                step={
+                    "step_status": AgentExecutionStatus.Completed, 
+                    "output": "All image tasks completed.", 
+                    "output_artifacts": artifacts,
+                    "is_last": True
+                }
             )
-            self.payments.ai_protocol.update_step(step["did"], step["task_id"], step_id=step["step_id"], step={"step_status": "Completed", "output": "All image tasks completed.", "output_artifacts": artifacts})
         except Exception as e:
-            self.payments.ai_protocol.update_step(step["did"], step["task_id"], step_id=step["step_id"], step={"step_status": "Failed", "output": "One or more image tasks failed."})
-            await log_message(
-                self.payments, 
+            self.payments.ai_protocol.update_step(
+                step["did"], 
                 step["task_id"], 
-                "error", 
-                f"Error during image tasks: {str(e)}", 
-                AgentExecutionStatus.Failed
+                step_id=step["step_id"], 
+                step={
+                    "step_status": AgentExecutionStatus.Failed, 
+                    "output": "One or more image tasks failed.",
+                    "output_artifacts": artifacts,
+                    "is_last": True
+                }
             )
-
 
     def generate_text_to_image_prompt(self, character):
         """
@@ -170,9 +175,42 @@ class OrchestratorAgent:
         Returns:
             str: The generated prompt string.
         """
-        return ", ".join(value for key, value in character.items() if key != "name")
+        text =  ", ".join(value for key, value in character.items() if key != "name")
 
-    async def query_agent_with_prompt(self, step, prompt, agent_name, validate_task_fn):
+        return text
+    
+    async def task_callback(self, data):
+        """
+        Handles updates from the sub-agent's task.
+
+        Args:
+            data: JSON data from the sub-agent.
+        """
+        task_id = data.get("task_id")
+
+        # Retrieve the Future associated with the task_id
+        task_future = await TaskRegistry.get_task(task_id)
+        if not task_future:
+            print(f"Received task update for unknown task_id: {task_id}")
+            return
+
+        try:
+            if data.get("task_status", None) == AgentExecutionStatus.Completed.value:
+                artifacts = await self.validate_image_generation_task(task_id)
+                task_future.set_result(artifacts)
+            elif data.get("task_status", None) == AgentExecutionStatus.Failed.value:
+                task_future.set_exception(Exception("Sub-agent task failed"))
+            else:
+                print(f"Task {task_id} is still in progress.")
+        except Exception as e:
+            task_future.set_exception(e)
+        finally:
+            # Remove the Future from the TaskRegistry once it is resolved
+            await TaskRegistry.remove_task(task_id)
+
+
+
+    async def query_agent_with_prompt(self, step, prompt, agent_name):
         """
         Queries an agent with a prompt, validates the task, and resolves with artifacts.
 
@@ -180,44 +218,39 @@ class OrchestratorAgent:
             step: The current step being processed.
             prompt: The input prompt for the agent.
             agent_name: The agent's name, for logging purposes.
-            validate_task_fn: Function to validate task completion.
 
         Returns:
             The artifacts produced by the agent's task.
         """
-        # Create a Future object to track completion
+        # Create a Future to track the task
         task_future = asyncio.get_event_loop().create_future()
 
-        async def task_callback(data):
-            """Handles updates from the sub-agent's task."""
-            print(':::RECEIVING TASK LOG EVENT:::')
-            task_log = json.loads(data)
-            if task_log.get("task_status", None) == AgentExecutionStatus.Completed.value:
-                artifacts = await validate_task_fn(task_log["task_id"])
-                print("Finished task:", task_log["task_id"], artifacts)
-                task_future.set_result(artifacts)  # Mark task as completed with artifacts
-            elif task_log.get("task_status", None) == AgentExecutionStatus.Failed.value:
-                await log_message(self.payments, step["task_id"], "error", task_log['message'], AgentExecutionStatus.Failed)
-                print("Task failed:", task_log["task_id"], task_log)
-                task_future.set_exception(Exception("Sub-agent task failed"))
-            else:
-                print("Task info:", task_log)
-                await log_message(self.payments, step["task_id"], "info", task_log['message'])
-
-        # Define task data and create the task
+        # Define the task data
         task_data = {"query": prompt, "name": step["name"], "additional_params": [], "artifacts": []}
+
+
+        # Create the task and retrieve the task_id
         result = await self.payments.ai_protocol.create_task(
-            IMAGE_GENERATOR_DID, task_data, task_callback
+            IMAGE_GENERATOR_DID, task_data, self.task_callback
         )
 
         if result.status_code != 201:
             raise Exception(f"Error creating task for {agent_name}: {result.data}")
 
-        # Await the Future until task_callback sets the result or exception
+        # Parse the task_id from the response
+        res_json = result.json()
+        task_id = res_json.get("task", {}).get("task_id")
+        if not task_id:
+            raise Exception("Failed to retrieve task_id from the sub-agent.")
+
+        # Register the Future in the TaskRegistry
+        await TaskRegistry.add_task(task_id, task_future)
+
+        # Wait for the Future to be resolved or rejected
         return await task_future
 
     
-    async def validate_generic_task(self, task_id, agent_did, parent_step):
+    async def validate_generic_task(self, task_id, agent_did, summoner_step):
         """
         Validates a generic task's completion and updates the parent step accordingly.
 
@@ -225,22 +258,32 @@ class OrchestratorAgent:
             task_id: The ID of the task to validate.
             agent_did: The DID of the agent that executed the task.
             access_config: Access configuration required to query the agent's data.
-            parent_step: The parent step that initiated the task.
+            summoner_step: The parent step that initiated the task.
         """
         task_result = self.payments.ai_protocol.get_task_with_steps(agent_did, task_id)
         task_data = task_result.json()
 
-        status = "Completed" if task_data["task"]["task_status"] == "Completed" else "Failed"
+        print(f"::: SOLVING STEP {summoner_step['step_id']} :::")
         self.payments.ai_protocol.update_step(
-            parent_step["did"], 
-            parent_step["task_id"], 
-            step_id=parent_step["step_id"], 
+            summoner_step["did"], 
+            summoner_step["task_id"], 
+            step_id=summoner_step["step_id"], 
             step={
-                "step_status": status, 
+                "step_status": task_data["task"]["task_status"], 
                 "output": task_data["task"].get("output", "Error during task execution"), 
-                "output_artifacts": task_data["task"].get("output_artifacts", [])
+                "output_artifacts": task_data["task"].get("output_artifacts", []),
+                "is_last": False
             }
         )
+
+    async def error_generic_task(self, step):
+        """
+        Updates a step's status to 'Failed' when an error occurs during task execution.
+
+        Args:
+            step: The step to update.
+        """
+        self.payments.ai_protocol.update_step(step["did"], step["task_id"], step_id=step["step_id"], step={"step_status": AgentExecutionStatus.failed.value, "output": "Error during subtask execution."})
 
 
     async def validate_image_generation_task(self, task_id):
@@ -256,4 +299,4 @@ class OrchestratorAgent:
         """
         task_result = self.payments.ai_protocol.get_task_with_steps(IMAGE_GENERATOR_DID, task_id)
         task_json = task_result.json()
-        return task_json["task"].get("output_artifacts", [])
+        return task_json["task"].get("output_artifacts", "")
